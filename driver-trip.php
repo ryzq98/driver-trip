@@ -2,7 +2,7 @@
 /*
 Plugin Name: Driver Trip System
 Description: Driver trip submission + Logistic Manager portal + Client List (Master Matrix) with locked fields + soft delete
-Version: 2.7
+Version: 2.7.1
 Author: Your Company
 */
 
@@ -226,6 +226,264 @@ add_action('wp_head', function () {
 });
 
 /* =========================================================
+   FRONTEND JS (CRITICAL FIX: no inline script in shortcode)
+   - prevents &#038; encoding and "Invalid or unexpected token"
+========================================================= */
+add_action('wp_enqueue_scripts', function () {
+    if (!is_user_logged_in()) return;
+
+    // register empty handle
+    wp_register_script('dts-frontend', '', [], '2.7.1', true);
+    wp_enqueue_script('dts-frontend');
+
+    $ajax = admin_url('admin-ajax.php');
+
+    $js = <<<JS
+(function(){
+  function postForm(ajaxUrl, params){
+    var fd = new FormData();
+    for (var k in params) fd.append(k, params[k]);
+    return fetch(ajaxUrl, { method:'POST', credentials:'same-origin', body: fd })
+      .then(function(r){ return r.text(); })
+      .then(function(txt){
+        try { return JSON.parse(txt); }
+        catch(e){ return { success:false, data:{ message: txt } }; }
+      });
+  }
+
+  function initTripForms(){
+    var forms = document.querySelectorAll('[data-dts-trip-form="1"]');
+    forms.forEach(function(root){
+      var sel = root.querySelector('select[data-dts-master="1"]');
+      var o = root.querySelector('input[data-dts-origin="1"]');
+      var d = root.querySelector('input[data-dts-destination="1"]');
+      if (!sel || !o || !d) return;
+
+      function sync(){
+        var opt = sel.options[sel.selectedIndex];
+        if (!opt) return;
+        o.value = opt.getAttribute('data-origin') || '';
+        d.value = opt.getAttribute('data-destination') || '';
+      }
+      sel.addEventListener('change', sync);
+      sync();
+    });
+  }
+
+  function initClientLists(){
+    var grids = document.querySelectorAll('table[data-dts-clientlist="1"]');
+    grids.forEach(function(grid){
+      var ajaxUrl = grid.getAttribute('data-ajax') || '';
+      var nonce = grid.getAttribute('data-nonce') || '';
+      var bodyId = grid.getAttribute('data-body') || '';
+      var plusId = grid.getAttribute('data-plus') || '';
+
+      var body = document.getElementById(bodyId);
+      var plusRow = document.getElementById(plusId);
+      if (!ajaxUrl || !nonce || !body || !plusRow) return;
+
+      function renumber(){
+        var nums = body.querySelectorAll('tr[data-id] .row-num');
+        var i=1;
+        nums.forEach(function(n){ n.textContent = i++; });
+      }
+
+      function allEmpty(tr){
+        var inputs = tr.querySelectorAll('input');
+        for (var i=0; i<inputs.length; i++){
+          if ((inputs[i].value || '').trim() !== '') return false;
+        }
+        return true;
+      }
+
+      function requiredFilled(tr){
+        var origin = (tr.querySelector('input[data-col="origin"]').value || '').trim();
+        var destination = (tr.querySelector('input[data-col="destination"]').value || '').trim();
+        var client_name = (tr.querySelector('input[data-col="client_name"]').value || '').trim();
+        var unit_name = (tr.querySelector('input[data-col="unit_name"]').value || '').trim();
+        return (!!origin && !!destination && !!client_name && !!unit_name);
+      }
+
+      function showDraftRow(){
+        if (body.querySelector('tr.dts-draft')) return;
+
+        var emptyRow = body.querySelector('.dts-empty-row');
+        if (emptyRow) emptyRow.remove();
+
+        var nextNum = (body.querySelectorAll('tr[data-id]').length || 0) + 1;
+
+        var tr = document.createElement('tr');
+        tr.className = 'dts-draft';
+        tr.innerHTML =
+          '<td class="numcell"><span class="row-num">'+ nextNum +'</span></td>'+
+          '<td><input class="dts-cell-input dts-draft-input" data-col="origin" type="text" placeholder="Origin"></td>'+
+          '<td><input class="dts-cell-input dts-draft-input" data-col="destination" type="text" placeholder="Destination"></td>'+
+          '<td><input class="dts-cell-input dts-draft-input" data-col="client_name" type="text" placeholder="Client"></td>'+
+          '<td><input class="dts-cell-input dts-draft-input" data-col="unit_name" type="text" placeholder="Unit" style="text-align:center;"></td>'+
+          '<td><input class="dts-cell-input dts-draft-input" data-col="rate" type="number" step="0.01" placeholder="(blank)" style="text-align:center;"></td>';
+
+        body.insertBefore(tr, plusRow);
+
+        var first = tr.querySelector('input[data-col="origin"]');
+        if (first) first.focus();
+
+        var cancelIfEmpty = function(e){
+          if (!body.contains(tr)) { document.removeEventListener('mousedown', cancelIfEmpty, true); return; }
+          if (tr.contains(e.target)) return;
+          if (allEmpty(tr)){
+            tr.remove();
+            document.removeEventListener('mousedown', cancelIfEmpty, true);
+
+            if (!body.querySelector('tr[data-id]')){
+              var emp = document.createElement('tr');
+              emp.className = 'dts-empty-row';
+              emp.innerHTML = '<td></td><td></td><td></td><td></td><td></td><td></td>';
+              body.insertBefore(emp, plusRow);
+            }
+          }
+        };
+        document.addEventListener('mousedown', cancelIfEmpty, true);
+
+        var creating = false;
+
+        function lockRowToSaved(tr, d){
+          tr.classList.remove('dts-draft');
+          tr.setAttribute('data-id', d.id);
+
+          tr.innerHTML =
+            '<td class="numcell">'+
+              '<span class="row-num"></span>'+
+              '<span class="row-actions"><button class="mini-btn dts-del" type="button" title="Delete">Del</button></span>'+
+            '</td>'+
+            '<td><input class="dts-cell-input" data-col="origin" type="text" value="'+ d.origin +'" readonly></td>'+
+            '<td><input class="dts-cell-input" data-col="destination" type="text" value="'+ d.destination +'" readonly></td>'+
+            '<td><input class="dts-cell-input" data-col="client_name" type="text" value="'+ d.client_name +'" readonly></td>'+
+            '<td><input class="dts-cell-input" data-col="unit_name" type="text" value="'+ d.unit_name +'" readonly style="text-align:center;"></td>'+
+            '<td><input class="dts-cell-input dts-edit" data-col="rate" type="number" step="0.01" value="'+ (d.rate||'') +'" placeholder="(blank)" style="text-align:center;"></td>';
+
+          renumber();
+        }
+
+        function tryCreate(){
+          if (creating) return;
+          if (!body.contains(tr)) return;
+          if (!requiredFilled(tr)) return;
+
+          creating = true;
+
+          var origin = (tr.querySelector('input[data-col="origin"]').value || '').trim();
+          var destination = (tr.querySelector('input[data-col="destination"]').value || '').trim();
+          var client_toggle = (tr.querySelector('input[data-col="client_name"]').value || '').trim();
+          var unit_toggle = (tr.querySelector('input[data-col="unit_name"]').value || '').trim();
+          var rate = (tr.querySelector('input[data-col="rate"]').value || '').trim();
+
+          postForm(ajaxUrl, {
+            action:'dts_create_master_row',
+            nonce: nonce,
+            origin: origin,
+            destination: destination,
+            client_name: client_toggle,
+            unit_name: unit_toggle,
+            rate: rate
+          }).then(function(out){
+            if (!out || !out.success){
+              creating = false;
+              alert((out && out.data && out.data.message) ? out.data.message : 'Failed to create row.');
+              return;
+            }
+            lockRowToSaved(tr, out.data);
+          });
+        }
+
+        tr.addEventListener('keydown', function(e){
+          if (e.target.tagName !== 'INPUT') return;
+          if (e.key === 'Enter'){
+            e.preventDefault();
+            tryCreate();
+            e.target.blur();
+          }
+          if (e.key === 'Escape' && allEmpty(tr)) tr.remove();
+        });
+
+        tr.addEventListener('focusout', function(){
+          setTimeout(function(){ tryCreate(); }, 0);
+        });
+      }
+
+      plusRow.addEventListener('click', showDraftRow);
+
+      function saveRate(tr, input){
+        var id = tr.getAttribute('data-id');
+        var val = (input.value || '').trim();
+
+        postForm(ajaxUrl, { action:'dts_update_master_rate', nonce: nonce, id: id, rate: val })
+          .then(function(out){
+            if (!out || !out.success){
+              alert((out && out.data && out.data.message) ? out.data.message : 'Failed to save rate.');
+              return;
+            }
+            input.value = out.data.rate || '';
+          });
+      }
+
+      body.addEventListener('keydown', function(e){
+        var input = e.target;
+        if (!input.classList.contains('dts-edit')) return;
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        var tr = input.closest('tr[data-id]');
+        saveRate(tr, input);
+        input.blur();
+      });
+
+      body.addEventListener('blur', function(e){
+        var input = e.target;
+        if (!input.classList.contains('dts-edit')) return;
+        var tr = input.closest('tr[data-id]');
+        saveRate(tr, input);
+      }, true);
+
+      body.addEventListener('click', function(e){
+        if (!e.target.classList.contains('dts-del')) return;
+        var tr = e.target.closest('tr[data-id]');
+        if (!tr) return;
+        if (!confirm('Delete this row?')) return;
+
+        var id = tr.getAttribute('data-id');
+        postForm(ajaxUrl, { action:'dts_delete_master_row', nonce: nonce, id: id })
+          .then(function(out){
+            if (!out || !out.success){
+              alert((out && out.data && out.data.message) ? out.data.message : 'Failed to delete.');
+              return;
+            }
+            tr.remove();
+            renumber();
+
+            if (!body.querySelector('tr[data-id]')){
+              var emp = document.createElement('tr');
+              emp.className = 'dts-empty-row';
+              emp.innerHTML = '<td></td><td></td><td></td><td></td><td></td><td></td>';
+              body.insertBefore(emp, plusRow);
+            }
+          });
+      });
+
+      renumber();
+      // console.log('[DTS] Client List JS bound OK', bodyId);
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', function(){
+    initTripForms();
+    initClientLists();
+  });
+})();
+JS;
+
+    wp_add_inline_script('dts-frontend', $js, 'after');
+});
+
+/* =========================================================
    SHORTCODE: USER MENU  [user_menu]
 ========================================================= */
 add_shortcode('user_menu', function () {
@@ -338,6 +596,7 @@ add_shortcode('lm_trips', function () {
 
 /* =========================================================
    SHORTCODE: DRIVER TRIP FORM  [driver_trip_form]
+   (Removed inline JS; uses enqueued JS above)
 ========================================================= */
 add_shortcode('driver_trip_form', function () {
     if (!is_user_logged_in()) {
@@ -358,7 +617,7 @@ add_shortcode('driver_trip_form', function () {
     $today = date('Y-m-d');
 
     ob_start(); ?>
-    <div class="dts-wrap">
+    <div class="dts-wrap" data-dts-trip-form="1">
       <div class="dts-card">
         <h2 class="dts-title">Submit Trip</h2>
 
@@ -369,7 +628,7 @@ add_shortcode('driver_trip_form', function () {
           <input type="date" name="trip_date" value="<?php echo esc_attr($today); ?>" required></p>
 
           <p><label>Client List Selection (Route + Client + Unit)</label>
-            <select name="master_id" id="dts_master_id" required>
+            <select name="master_id" id="dts_master_id" data-dts-master="1" required>
               <option value="">Select...</option>
               <?php foreach ($options as $o): ?>
                 <option value="<?php echo esc_attr($o->id); ?>"
@@ -383,12 +642,12 @@ add_shortcode('driver_trip_form', function () {
               <div class="dts-muted" style="margin-top:6px;">No client list rows yet. Logistic Manager must add them in Client List first.</div>
             <?php endif; ?>
           </p>
-          
+
           <p><label>Origin</label>
-          <input type="text" name="origin" id="dts_origin" readonly required></p>
+          <input type="text" name="origin" id="dts_origin" data-dts-origin="1" readonly required></p>
 
           <p><label>Destination</label>
-          <input type="text" name="destination" id="dts_destination" readonly required></p>
+          <input type="text" name="destination" id="dts_destination" data-dts-destination="1" readonly required></p>
 
           <p><label>Weight / Trip</label>
           <input type="number" step="0.01" name="weight" required></p>
@@ -398,24 +657,6 @@ add_shortcode('driver_trip_form', function () {
 
           <p><input type="submit" class="dts-btn" name="save_trip" value="Submit Trip"></p>
         </form>
-
-        <script>
-          (function(){
-            var sel = document.getElementById("dts_master_id");
-            var o = document.getElementById("dts_origin");
-            var d = document.getElementById("dts_destination");
-            if(!sel || !o || !d) return;
-
-            function sync(){
-              var opt = sel.options[sel.selectedIndex];
-              if(!opt) return;
-              o.value = opt.getAttribute("data-origin") || "";
-              d.value = opt.getAttribute("data-destination") || "";
-            }
-            sel.addEventListener("change", sync);
-            sync();
-          })();
-        </script>
       </div>
     </div>
     <?php
@@ -424,6 +665,7 @@ add_shortcode('driver_trip_form', function () {
 
 /* =========================================================
    SHORTCODE: CLIENT LIST  [dts_client_list]
+   (Removed inline JS; uses enqueued JS above)
 ========================================================= */
 add_shortcode('dts_client_list', function () {
     if (!dts_is_lm_admin()) {
@@ -438,6 +680,10 @@ add_shortcode('dts_client_list', function () {
     $nonce = wp_create_nonce('dts_client_list');
     $ajax  = admin_url('admin-ajax.php');
 
+    $uid = 'dts_' . wp_generate_uuid4();
+    $bodyId = $uid . '_body';
+    $plusId = $uid . '_plus';
+
     ob_start(); ?>
     <div class="dts-wrap">
       <div class="dts-card">
@@ -448,9 +694,14 @@ add_shortcode('dts_client_list', function () {
           Delete is soft-delete (keeps old trip records).
         </p>
 
-        <?php $uid = 'dts_' . wp_generate_uuid4(); ?>
         <div class="dts-grid-wrap">
-          <table class="dts-grid" id="<?php echo esc_attr($uid); ?>_grid">
+          <table class="dts-grid"
+                 id="<?php echo esc_attr($uid); ?>_grid"
+                 data-dts-clientlist="1"
+                 data-ajax="<?php echo esc_attr($ajax); ?>"
+                 data-nonce="<?php echo esc_attr($nonce); ?>"
+                 data-body="<?php echo esc_attr($bodyId); ?>"
+                 data-plus="<?php echo esc_attr($plusId); ?>">
             <colgroup>
               <col style="width:6.6667%;">
               <col style="width:19.0476%;">
@@ -459,7 +710,7 @@ add_shortcode('dts_client_list', function () {
               <col style="width:13.3333%;">
               <col style="width:13.3333%;">
             </colgroup>
-        
+
             <thead>
               <tr>
                 <th rowspan="2">#</th>
@@ -473,8 +724,8 @@ add_shortcode('dts_client_list', function () {
                 <th>Destination</th>
               </tr>
             </thead>
-        
-            <tbody id="<?php echo esc_attr($uid); ?>_body">
+
+            <tbody id="<?php echo esc_attr($bodyId); ?>">
               <?php if ($rows): ?>
                 <?php $i=1; foreach ($rows as $r): ?>
                   <tr data-id="<?php echo esc_attr($r->id); ?>">
@@ -484,12 +735,12 @@ add_shortcode('dts_client_list', function () {
                         <button class="mini-btn dts-del" type="button" title="Delete">Del</button>
                       </span>
                     </td>
-        
+
                     <td><input class="dts-cell-input" data-col="origin" type="text" value="<?php echo esc_attr($r->origin); ?>" readonly></td>
                     <td><input class="dts-cell-input" data-col="destination" type="text" value="<?php echo esc_attr($r->destination); ?>" readonly></td>
                     <td><input class="dts-cell-input" data-col="client_name" type="text" value="<?php echo esc_attr($r->client_name); ?>" readonly></td>
                     <td><input class="dts-cell-input" data-col="unit_name" type="text" value="<?php echo esc_attr($r->unit_name); ?>" readonly style="text-align:center;"></td>
-        
+
                     <td>
                       <input class="dts-cell-input dts-edit" data-col="rate" type="number" step="0.01"
                              value="<?php echo is_null($r->rate) ? '' : esc_attr(number_format((float)$r->rate, 2, '.', '')); ?>"
@@ -500,235 +751,14 @@ add_shortcode('dts_client_list', function () {
               <?php else: ?>
                 <tr class="dts-empty-row"><td></td><td></td><td></td><td></td><td></td><td></td></tr>
               <?php endif; ?>
-        
-              <tr id="<?php echo esc_attr($uid); ?>_plus">
+
+              <tr id="<?php echo esc_attr($plusId); ?>">
                 <td class="center dts-plus" title="Add">+</td>
                 <td></td><td></td><td></td><td></td><td></td>
               </tr>
             </tbody>
           </table>
         </div>
-        
-        <script>
-        document.addEventListener('DOMContentLoaded', function () {
-          try {
-            var ajaxUrl = <?php echo json_encode($ajax); ?>;
-            var nonce   = <?php echo json_encode($nonce); ?>;
-        
-            var bodyId  = <?php echo json_encode($uid . '_body'); ?>;
-            var plusId  = <?php echo json_encode($uid . '_plus'); ?>;
-        
-            var body    = document.getElementById(bodyId);
-            var plusRow = document.getElementById(plusId);
-        
-            if (!body || !plusRow) {
-              console.warn('[DTS] grid elements not found', {body: !!body, plusRow: !!plusRow});
-              return;
-            }
-        
-            function post(params){
-              var fd = new FormData();
-              for (var k in params) fd.append(k, params[k]);
-              return fetch(ajaxUrl, { method:'POST', credentials:'same-origin', body: fd })
-                .then(function(r){ return r.text(); })
-                .then(function(txt){
-                  try { return JSON.parse(txt); }
-                  catch(e){ return { success:false, data:{ message: txt } }; }
-                });
-            }
-        
-            function renumber(){
-              var nums = body.querySelectorAll('tr[data-id] .row-num');
-              var i=1;
-              nums.forEach(function(n){ n.textContent = i++; });
-            }
-        
-            function allEmpty(tr){
-              var inputs = tr.querySelectorAll('input');
-              for (var i=0; i<inputs.length; i++){
-                if ((inputs[i].value || '').trim() !== '') return false;
-              }
-              return true;
-            }
-        
-            function requiredFilled(tr){
-              var origin = (tr.querySelector('input[data-col="origin"]').value || '').trim();
-              var destination = (tr.querySelector('input[data-col="destination"]').value || '').trim();
-              var client_name = (tr.querySelector('input[data-col="client_name"]').value || '').trim();
-              var unit_name = (tr.querySelector('input[data-col="unit_name"]').value || '').trim();
-              return origin && destination && client_name && unit_name;
-            }
-        
-            function showDraftRow(){
-              if (body.querySelector('tr.dts-draft')) return;
-        
-              var emptyRow = body.querySelector('.dts-empty-row');
-              if (emptyRow) emptyRow.remove();
-        
-              var nextNum = (body.querySelectorAll('tr[data-id]').length || 0) + 1;
-        
-              var tr = document.createElement('tr');
-              tr.className = 'dts-draft';
-              tr.innerHTML =
-                '<td class="numcell"><span class="row-num">'+ nextNum +'</span></td>'+
-                '<td><input class="dts-cell-input dts-draft-input" data-col="origin" type="text" placeholder="Origin"></td>'+
-                '<td><input class="dts-cell-input dts-draft-input" data-col="destination" type="text" placeholder="Destination"></td>'+
-                '<td><input class="dts-cell-input dts-draft-input" data-col="client_name" type="text" placeholder="Client"></td>'+
-                '<td><input class="dts-cell-input dts-draft-input" data-col="unit_name" type="text" placeholder="Unit" style="text-align:center;"></td>'+
-                '<td><input class="dts-cell-input dts-draft-input" data-col="rate" type="number" step="0.01" placeholder="(blank)" style="text-align:center;"></td>';
-        
-              body.insertBefore(tr, plusRow);
-        
-              var first = tr.querySelector('input[data-col="origin"]');
-              if (first) first.focus();
-        
-              var cancelIfEmpty = function(e){
-                if (!body.contains(tr)) { document.removeEventListener('mousedown', cancelIfEmpty, true); return; }
-                if (tr.contains(e.target)) return;
-                if (allEmpty(tr)){
-                  tr.remove();
-                  document.removeEventListener('mousedown', cancelIfEmpty, true);
-        
-                  if (!body.querySelector('tr[data-id]')){
-                    var emp = document.createElement('tr');
-                    emp.className = 'dts-empty-row';
-                    emp.innerHTML = '<td></td><td></td><td></td><td></td><td></td><td></td>';
-                    body.insertBefore(emp, plusRow);
-                  }
-                }
-              };
-              document.addEventListener('mousedown', cancelIfEmpty, true);
-        
-              var creating = false;
-        
-              function lockRowToSaved(tr, d){
-                tr.classList.remove('dts-draft');
-                tr.setAttribute('data-id', d.id);
-        
-                tr.innerHTML =
-                  '<td class="numcell">'+
-                    '<span class="row-num"></span>'+
-                    '<span class="row-actions"><button class="mini-btn dts-del" type="button" title="Delete">Del</button></span>'+
-                  '</td>'+
-                  '<td><input class="dts-cell-input" data-col="origin" type="text" value="'+ d.origin +'" readonly></td>'+
-                  '<td><input class="dts-cell-input" data-col="destination" type="text" value="'+ d.destination +'" readonly></td>'+
-                  '<td><input class="dts-cell-input" data-col="client_name" type="text" value="'+ d.client_name +'" readonly></td>'+
-                  '<td><input class="dts-cell-input" data-col="unit_name" type="text" value="'+ d.unit_name +'" readonly style="text-align:center;"></td>'+
-                  '<td><input class="dts-cell-input dts-edit" data-col="rate" type="number" step="0.01" value="'+ (d.rate||'') +'" placeholder="(blank)" style="text-align:center;"></td>';
-        
-                renumber();
-              }
-        
-              async function tryCreate(){
-                if (creating) return;
-                if (!body.contains(tr)) return;
-                if (!requiredFilled(tr)) return;
-        
-                creating = true;
-        
-                var origin = (tr.querySelector('input[data-col="origin"]').value || '').trim();
-                var destination = (tr.querySelector('input[data-col="destination"]').value || '').trim();
-                var client_name = (tr.querySelector('input[data-col="client_name"]').value || '').trim();
-                var unit_name = (tr.querySelector('input[data-col="unit_name"]').value || '').trim();
-                var rate = (tr.querySelector('input[data-col="rate"]').value || '').trim();
-        
-                var out = await post({
-                  action:'dts_create_master_row',
-                  nonce: nonce,
-                  origin: origin,
-                  destination: destination,
-                  client_name: client_name,
-                  unit_name: unit_name,
-                  rate: rate
-                });
-        
-                if (!out || !out.success){
-                  creating = false;
-                  alert((out && out.data && out.data.message) ? out.data.message : 'Failed to create row.');
-                  return;
-                }
-        
-                lockRowToSaved(tr, out.data);
-              }
-        
-              tr.addEventListener('keydown', function(e){
-                if (e.target.tagName !== 'INPUT') return;
-                if (e.key === 'Enter'){
-                  e.preventDefault();
-                  tryCreate();
-                  e.target.blur();
-                }
-                if (e.key === 'Escape' && allEmpty(tr)) tr.remove();
-              });
-        
-              tr.addEventListener('focusout', function(){
-                setTimeout(function(){ tryCreate(); }, 0);
-              });
-            }
-        
-            plusRow.addEventListener('click', showDraftRow);
-        
-            async function saveRate(tr, input){
-              var id = tr.getAttribute('data-id');
-              var val = (input.value || '').trim();
-        
-              var out = await post({ action:'dts_update_master_rate', nonce: nonce, id: id, rate: val });
-              if (!out || !out.success){
-                alert((out && out.data && out.data.message) ? out.data.message : 'Failed to save rate.');
-                return;
-              }
-              input.value = out.data.rate || '';
-            }
-        
-            body.addEventListener('keydown', function(e){
-              var input = e.target;
-              if (!input.classList.contains('dts-edit')) return;
-              if (e.key !== 'Enter') return;
-              e.preventDefault();
-              var tr = input.closest('tr[data-id]');
-              saveRate(tr, input);
-              input.blur();
-            });
-        
-            body.addEventListener('blur', function(e){
-              var input = e.target;
-              if (!input.classList.contains('dts-edit')) return;
-              var tr = input.closest('tr[data-id]');
-              saveRate(tr, input);
-            }, true);
-        
-            body.addEventListener('click', async function(e){
-              if (!e.target.classList.contains('dts-del')) return;
-              var tr = e.target.closest('tr[data-id]');
-              if (!tr) return;
-              if (!confirm('Delete this row?')) return;
-        
-              var id = tr.getAttribute('data-id');
-              var out = await post({ action:'dts_delete_master_row', nonce: nonce, id: id });
-        
-              if (!out || !out.success){
-                alert((out && out.data && out.data.message) ? out.data.message : 'Failed to delete.');
-                return;
-              }
-        
-              tr.remove();
-              renumber();
-        
-              if (!body.querySelector('tr[data-id]')){
-                var emp = document.createElement('tr');
-                emp.className = 'dts-empty-row';
-                emp.innerHTML = '<td></td><td></td><td></td><td></td><td></td><td></td>';
-                body.insertBefore(emp, plusRow);
-              }
-            });
-        
-            renumber();
-            console.log('[DTS] Client List JS bound OK');
-          } catch (err) {
-            console.error('[DTS] Client List JS failed', err);
-          }
-        });
-        </script>
 
       </div>
     </div>
@@ -783,23 +813,19 @@ add_action('wp_ajax_dts_create_master_row', function () {
         ]);
     }
 
-    $rate = null;
-    if ($rate_raw !== '') $rate = floatval($rate_raw);
-
-    // Use $wpdb->insert so it truly persists
-    $ok = $wpdb->insert($tMatrix, [
-        'origin'      => $origin,
-        'destination' => $dest,
-        'client_name' => $client,
-        'unit_name'   => $unit,
-        'rate'        => $rate,
-        'is_complete' => 1,
-        'active'      => 1,
-    ], [
-        '%s','%s','%s','%s',
-        ($rate === null ? '%s' : '%f'), // harmless; WP will handle null
-        '%d','%d'
-    ]);
+    // Insert with NULL-safe rate
+    if ($rate_raw === '') {
+        $ok = $wpdb->query($wpdb->prepare("
+            INSERT INTO $tMatrix (origin, destination, client_name, unit_name, rate, is_complete, active)
+            VALUES (%s, %s, %s, %s, NULL, 1, 1)
+        ", $origin, $dest, $client, $unit));
+    } else {
+        $rate = floatval($rate_raw);
+        $ok = $wpdb->query($wpdb->prepare("
+            INSERT INTO $tMatrix (origin, destination, client_name, unit_name, rate, is_complete, active)
+            VALUES (%s, %s, %s, %s, %f, 1, 1)
+        ", $origin, $dest, $client, $unit, $rate));
+    }
 
     if ($ok === false) {
         wp_send_json_error(['message' => 'DB insert failed: ' . $wpdb->last_error], 500);
@@ -839,12 +865,12 @@ add_action('wp_ajax_dts_update_master_rate', function () {
     if ($exists === 0) wp_send_json_error(['message' => 'Row not found.'], 404);
 
     if ($rate_raw === '') {
-        $ok = $wpdb->update($tMatrix, ['rate' => null], ['id' => $id], ['%s'], ['%d']);
+        $ok = $wpdb->query($wpdb->prepare("UPDATE $tMatrix SET rate=NULL WHERE id=%d", $id));
         if ($ok === false) wp_send_json_error(['message' => 'DB error: ' . $wpdb->last_error], 500);
         wp_send_json_success(['rate' => '']);
     } else {
         $rate = floatval($rate_raw);
-        $ok = $wpdb->update($tMatrix, ['rate' => $rate], ['id' => $id], ['%f'], ['%d']);
+        $ok = $wpdb->query($wpdb->prepare("UPDATE $tMatrix SET rate=%f WHERE id=%d", $rate, $id));
         if ($ok === false) wp_send_json_error(['message' => 'DB error: ' . $wpdb->last_error], 500);
         wp_send_json_success(['rate' => number_format((float)$rate, 2, '.', '')]);
     }
