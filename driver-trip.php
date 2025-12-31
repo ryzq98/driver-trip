@@ -22,10 +22,19 @@ function dts_is_lm()     { return dts_user_has_role('logistic_manager'); }
 function dts_is_admin()  { return is_user_logged_in() && current_user_can('manage_options'); }
 
 function dts_can_submit_trip() {
-    return is_user_logged_in() && (dts_is_driver() || dts_is_lm() || dts_is_admin());
+    return is_user_logged_in() && (
+        dts_is_driver() ||
+        dts_is_lm() ||
+        current_user_can('edit_posts') ||
+        dts_is_admin()
+    );
 }
 function dts_is_lm_admin() {
-    return is_user_logged_in() && (dts_is_lm() || dts_is_admin());
+    return is_user_logged_in() && (
+        dts_is_lm() ||
+        current_user_can('edit_posts') ||
+        dts_is_admin()
+    );
 }
 function dts_matrix_is_complete($origin, $dest, $client, $unit) {
     return (trim((string)$origin) !== '' && trim((string)$dest) !== '' && trim((string)$client) !== '' && trim((string)$unit) !== '');
@@ -44,6 +53,11 @@ add_action('send_headers', function () {
    ACTIVATION: ROLES + TABLES
 ========================================================= */
 register_activation_hook(__FILE__, function () {
+    dts_ensure_roles();
+    dts_ensure_tables();
+});
+
+function dts_ensure_roles() {
     if (!get_role('driver')) add_role('driver', 'Driver', ['read' => true]);
     if (!get_role('logistic_manager')) {
         add_role('logistic_manager', 'Logistic Manager', [
@@ -51,6 +65,12 @@ register_activation_hook(__FILE__, function () {
             'edit_posts' => true,
         ]);
     }
+}
+
+function dts_ensure_tables() {
+    static $checked = false;
+    if ($checked) return;
+    $checked = true;
 
     global $wpdb;
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
@@ -59,6 +79,38 @@ register_activation_hook(__FILE__, function () {
     $tTrips  = $wpdb->prefix . 'driver_trips';
     $tMatrix = $wpdb->prefix . 'dts_master_matrix';
 
+    $wpdb->query("CREATE TABLE IF NOT EXISTS $tTrips (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        user_id BIGINT UNSIGNED NOT NULL,
+        trip_date DATE NOT NULL,
+        origin VARCHAR(191) NOT NULL,
+        destination VARCHAR(191) NOT NULL,
+        weight DECIMAL(12,2) NOT NULL DEFAULT 0,
+        bill_number VARCHAR(191) NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY user_id (user_id),
+        KEY trip_date (trip_date)
+    ) $charset;");
+
+    $wpdb->query("CREATE TABLE IF NOT EXISTS $tMatrix (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        origin VARCHAR(191) NOT NULL,
+        destination VARCHAR(191) NOT NULL,
+        client_name VARCHAR(191) NOT NULL,
+        unit_name VARCHAR(191) NOT NULL,
+        rate DECIMAL(12,2) NULL DEFAULT NULL,
+        is_complete TINYINT(1) NOT NULL DEFAULT 0,
+        active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY active (active),
+        KEY is_complete (is_complete),
+        KEY lookup (origin, destination, client_name, unit_name)
+    ) $charset;
+");
+
+    // Ensure schema is updated to latest shape
     dbDelta("CREATE TABLE $tTrips (
         id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
         user_id BIGINT UNSIGNED NOT NULL,
@@ -95,19 +147,13 @@ register_activation_hook(__FILE__, function () {
                       WHEN TRIM(origin)<>'' AND TRIM(destination)<>'' AND TRIM(client_name)<>'' AND TRIM(unit_name)<>'' THEN 1
                       ELSE 0
                   END");
-});
+}
 
 /* =========================================================
    INIT: Ensure roles exist (safe)
 ========================================================= */
 add_action('init', function () {
-    if (!get_role('driver')) add_role('driver', 'Driver', ['read' => true]);
-    if (!get_role('logistic_manager')) {
-        add_role('logistic_manager', 'Logistic Manager', [
-            'read'       => true,
-            'edit_posts' => true,
-        ]);
-    }
+    dts_ensure_roles();
 }, 1);
 
 /* =========================================================
@@ -115,6 +161,7 @@ add_action('init', function () {
 ========================================================= */
 add_action('init', function () {
     global $wpdb;
+    dts_ensure_tables();
     $tMatrix = $wpdb->prefix . 'dts_master_matrix';
 
     $exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $tMatrix));
@@ -274,13 +321,29 @@ add_action('template_redirect', function () {
     }
 
     global $wpdb;
-    $tTrips = $wpdb->prefix . 'driver_trips';
+    dts_ensure_tables();
+    $tTrips  = $wpdb->prefix . 'driver_trips';
+    $tMatrix = $wpdb->prefix . 'dts_master_matrix';
+
+    $master_id = (int)($_POST['master_id'] ?? 0);
+    if ($master_id <= 0) {
+        wp_die('Please select a Client List row before submitting.');
+    }
+
+    $master = $wpdb->get_row($wpdb->prepare(
+        "SELECT origin, destination FROM $tMatrix WHERE id=%d AND active=1 AND is_complete=1",
+        $master_id
+    ));
+
+    if (!$master) {
+        wp_die('Invalid or inactive Client List selection.');
+    }
 
     $ok = $wpdb->insert($tTrips, [
         'user_id'     => get_current_user_id(),
         'trip_date'   => sanitize_text_field($_POST['trip_date']),
-        'origin'      => sanitize_text_field($_POST['origin']),
-        'destination' => sanitize_text_field($_POST['destination']),
+        'origin'      => sanitize_text_field($master->origin),
+        'destination' => sanitize_text_field($master->destination),
         'weight'      => floatval($_POST['weight']),
         'bill_number' => sanitize_text_field($_POST['bill_number']),
     ], ['%d','%s','%s','%s','%f','%s']);
@@ -348,6 +411,7 @@ add_shortcode('driver_trip_form', function () {
     }
 
     global $wpdb;
+    dts_ensure_tables();
     $tMatrix = $wpdb->prefix . 'dts_master_matrix';
 
     $options = $wpdb->get_results("SELECT id, origin, destination, client_name, unit_name
@@ -431,6 +495,7 @@ add_shortcode('dts_client_list', function () {
     }
 
     global $wpdb;
+    dts_ensure_tables();
     $tMatrix = $wpdb->prefix . 'dts_master_matrix';
 
     $rows = $wpdb->get_results("SELECT * FROM $tMatrix WHERE active=1 ORDER BY origin ASC, destination ASC, client_name ASC, unit_name ASC, id DESC");
@@ -751,6 +816,7 @@ add_action('wp_ajax_dts_create_master_row', function () {
     check_ajax_referer('dts_client_list', 'nonce');
 
     global $wpdb;
+    dts_ensure_tables();
     $tMatrix = $wpdb->prefix . 'dts_master_matrix';
 
     $origin = sanitize_text_field($_POST['origin'] ?? '');
@@ -828,6 +894,7 @@ add_action('wp_ajax_dts_update_master_rate', function () {
     check_ajax_referer('dts_client_list', 'nonce');
 
     global $wpdb;
+    dts_ensure_tables();
     $tMatrix = $wpdb->prefix . 'dts_master_matrix';
 
     $id = (int)($_POST['id'] ?? 0);
@@ -855,6 +922,7 @@ add_action('wp_ajax_dts_delete_master_row', function () {
     check_ajax_referer('dts_client_list', 'nonce');
 
     global $wpdb;
+    dts_ensure_tables();
     $tMatrix = $wpdb->prefix . 'dts_master_matrix';
     $id = (int)($_POST['id'] ?? 0);
     if ($id <= 0) wp_send_json_error(['message' => 'Invalid ID'], 400);
