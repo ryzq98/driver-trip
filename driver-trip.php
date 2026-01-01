@@ -306,14 +306,54 @@ add_action('wp_enqueue_scripts', function () {
       var d = root.querySelector('input[data-dts-destination="1"]');
       if (!sel || !o || !d) return;
 
+      var masterAjax = sel.getAttribute('data-master-ajax') || '';
+      var masterNonce = sel.getAttribute('data-master-nonce') || '';
+
+      function rebuildOptions(list){
+        while (sel.firstChild) sel.removeChild(sel.firstChild);
+
+        if (!list || !list.length){
+          var empty = document.createElement('option');
+          empty.value = '';
+          empty.textContent = 'No client list rows yet';
+          sel.appendChild(empty);
+          return;
+        }
+
+        list.forEach(function(item){
+          var opt = document.createElement('option');
+          opt.value = item.id;
+          opt.setAttribute('data-origin', item.origin);
+          opt.setAttribute('data-destination', item.destination);
+          opt.textContent = item.origin + ' → ' + item.destination + ' | ' + item.client_name + ' | ' + item.unit_name;
+          sel.appendChild(opt);
+        });
+      }
+
       function sync(){
         var opt = sel.options[sel.selectedIndex];
         if (!opt) return;
         o.value = opt.getAttribute('data-origin') || '';
         d.value = opt.getAttribute('data-destination') || '';
       }
+
+      function refreshOptions(){
+        if (!masterAjax || !masterNonce) return;
+
+        postForm(masterAjax, { action:'dts_fetch_master_options', nonce: masterNonce })
+          .then(function(out){
+            if (!out || !out.success) return;
+            rebuildOptions(out.data.options);
+            sync();
+          });
+      }
+
       sel.addEventListener('change', sync);
       sync();
+
+      refreshOptions();
+
+      document.addEventListener('dts:masterChanged', refreshOptions);
     });
   }
 
@@ -328,6 +368,10 @@ add_action('wp_enqueue_scripts', function () {
       var body = document.getElementById(bodyId);
       var plusRow = document.getElementById(plusId);
       if (!ajaxUrl || !nonce || !body || !plusRow) return;
+
+      function broadcastMasterChange(){
+        document.dispatchEvent(new CustomEvent('dts:masterChanged'));
+      }
 
       function renumber(){
         var nums = body.querySelectorAll('tr[data-id] .row-num');
@@ -439,6 +483,7 @@ add_action('wp_enqueue_scripts', function () {
               return;
             }
             lockRowToSaved(tr, out.data);
+            broadcastMasterChange();
           });
         }
 
@@ -512,6 +557,8 @@ add_action('wp_enqueue_scripts', function () {
               emp.innerHTML = '<td></td><td></td><td></td><td></td><td></td><td></td>';
               body.insertBefore(emp, plusRow);
             }
+
+            broadcastMasterChange();
           });
       });
 
@@ -678,6 +725,9 @@ add_shortcode('driver_trip_form', function () {
                                   WHERE active=1 AND is_complete=1
                                   ORDER BY origin ASC, destination ASC, client_name ASC, unit_name ASC");
 
+    $ajax_master = admin_url('admin-ajax.php');
+    $master_nonce = wp_create_nonce('dts_fetch_master');
+
     $today = date('Y-m-d');
 
     ob_start(); ?>
@@ -691,8 +741,12 @@ add_shortcode('driver_trip_form', function () {
           <p><label>Date</label>
           <input type="date" name="trip_date" value="<?php echo esc_attr($today); ?>" required></p>
 
-          <p><label>Client List Selection (Route + Client + Unit)</label>
-            <select name="master_id" id="dts_master_id" data-dts-master="1" required>
+            <p><label>Client List Selection (Route + Client + Unit)</label>
+              <select name="master_id" id="dts_master_id"
+                      data-dts-master="1"
+                      data-master-ajax="<?php echo esc_attr($ajax_master); ?>"
+                      data-master-nonce="<?php echo esc_attr($master_nonce); ?>"
+                      required>
               <option value="">Select...</option>
               <?php foreach ($options as $o): ?>
                 <option value="<?php echo esc_attr($o->id); ?>"
@@ -841,6 +895,34 @@ add_action('wp_ajax_dts_ping', function () {
 /* =========================================================
    AJAX: Create / Update Rate / Delete (Client List)
 ========================================================= */
+add_action('wp_ajax_dts_fetch_master_options', function () {
+    if (!dts_can_submit_trip()) wp_send_json_error(['message' => 'Access denied'], 403);
+    check_ajax_referer('dts_fetch_master', 'nonce');
+
+    global $wpdb;
+    dts_ensure_tables();
+    $tMatrix = $wpdb->prefix . 'dts_master_matrix';
+
+    $rows = $wpdb->get_results("SELECT id, origin, destination, client_name, unit_name, rate
+                                FROM $tMatrix
+                                WHERE active=1 AND is_complete=1
+                                ORDER BY origin ASC, destination ASC, client_name ASC, unit_name ASC");
+
+    $out = [];
+    foreach ($rows as $r) {
+        $out[] = [
+            'id' => (int)$r->id,
+            'origin' => esc_html($r->origin),
+            'destination' => esc_html($r->destination),
+            'client_name' => esc_html($r->client_name),
+            'unit_name' => esc_html($r->unit_name),
+            'rate' => is_null($r->rate) ? '' : number_format((float)$r->rate, 2, '.', ''),
+        ];
+    }
+
+    wp_send_json_success(['options' => $out]);
+});
+
 add_action('wp_ajax_dts_create_master_row', function () {
     if (!dts_is_lm_admin()) wp_send_json_error(['message' => 'Access denied'], 403);
     check_ajax_referer('dts_client_list', 'nonce');
