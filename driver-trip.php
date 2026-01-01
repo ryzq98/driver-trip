@@ -22,10 +22,19 @@ function dts_is_lm()     { return dts_user_has_role('logistic_manager'); }
 function dts_is_admin()  { return is_user_logged_in() && current_user_can('manage_options'); }
 
 function dts_can_submit_trip() {
-    return is_user_logged_in() && (dts_is_driver() || dts_is_lm() || dts_is_admin());
+    return is_user_logged_in() && (
+        dts_is_driver() ||
+        dts_is_lm() ||
+        current_user_can('edit_posts') ||
+        dts_is_admin()
+    );
 }
 function dts_is_lm_admin() {
-    return is_user_logged_in() && (dts_is_lm() || dts_is_admin());
+    return is_user_logged_in() && (
+        dts_is_lm() ||
+        current_user_can('edit_posts') ||
+        dts_is_admin()
+    );
 }
 function dts_matrix_is_complete($origin, $dest, $client, $unit) {
     return (trim((string)$origin) !== '' && trim((string)$dest) !== '' && trim((string)$client) !== '' && trim((string)$unit) !== '');
